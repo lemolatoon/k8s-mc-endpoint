@@ -107,7 +107,7 @@ func listHandler(cli *kubernetes.Clientset, cfg *rest.Config) http.HandlerFunc {
 
 		go exec.Stream(remotecommand.StreamOptions{Stdin: pr, Stdout: &out, Stderr: &out, Tty: true})
 		pw.Write([]byte("/list\n"))
-		time.Sleep(3 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 		pw.Close()
 
 		// extract lines like: "There are X of a max ... players online: ..."
