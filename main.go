@@ -119,10 +119,27 @@ func listHandler(cli *kubernetes.Clientset, cfg *rest.Config) http.HandlerFunc {
 			}
 		}
 		result := strings.Join(matches, "\n")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if result == "" {
 			result = "(no player list received)"
+      w.Write([]byte(result + "\n"))
+      return
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+    tsRe := regexp.MustCompile(`\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]`)
+    for _, raw := range strings.Split(result, "\n") {
+      raw = strings.TrimSpace(raw)
+      if raw == "" {
+        continue
+      }
+      // keep substring starting from timestamp, if present
+      idx := tsRe.FindStringIndex(raw)
+      if idx != nil {
+        raw = raw[idx[0]:] // drop anything to the left of timestamp
+      } else if raw == "" || raw == "\n" {
+        continue
+      }
+      result += raw
+    }
 		w.Write([]byte(result + "\n"))
 	}
 }
