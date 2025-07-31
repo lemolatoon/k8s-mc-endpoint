@@ -138,9 +138,8 @@ func listHandler(cli *kubernetes.Clientset, cfg *rest.Config) http.HandlerFunc {
       } else if raw == "" || raw == "\n" {
         continue
       }
-      result += raw
+      w.Write([]byte(raw + "\n"))
     }
-		w.Write([]byte(result + "\n"))
 	}
 }
 
