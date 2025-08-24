@@ -78,7 +78,7 @@ func logsHandler(cli *kubernetes.Clientset) http.HandlerFunc {
 
 // listHandler sends "/list" to the server, waits 3 s, returns matching line(s)
 func listHandler(cli *kubernetes.Clientset, cfg *rest.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+    return func(w http.ResponseWriter, r *http.Request) {
 		pods, err := cli.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: labelSelector, Limit: 1})
 		if err != nil || len(pods.Items) == 0 {
 			http.Error(w, "no target pod", http.StatusInternalServerError)
@@ -99,16 +99,18 @@ func listHandler(cli *kubernetes.Clientset, cfg *rest.Config) http.HandlerFunc {
 				TTY:       true,
 			}, runtime.NewParameterCodec(scheme))
 
-		exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", attach.URL())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+        exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", attach.URL())
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
 
-		go exec.Stream(remotecommand.StreamOptions{Stdin: pr, Stdout: &out, Stderr: &out, Tty: true})
-		pw.Write([]byte("/list\n"))
-		time.Sleep(100 * time.Millisecond)
-		pw.Close()
+        ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+        defer cancel()
+        go exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdin: pr, Stdout: &out, Stderr: &out, Tty: true})
+        pw.Write([]byte("/list\n"))
+        time.Sleep(100 * time.Millisecond)
+        pw.Close()
 
 		// extract lines like: "There are X of a max ... players online: ..."
 		re := regexp.MustCompile(`There are .* players online:`)
@@ -122,70 +124,148 @@ func listHandler(cli *kubernetes.Clientset, cfg *rest.Config) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if result == "" {
 			result = "(no player list received)"
-      w.Write([]byte(result + "\n"))
-      return
+			w.Write([]byte(result + "\n"))
+			return
 		}
-    tsRe := regexp.MustCompile(`\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]`)
-    for _, raw := range strings.Split(result, "\n") {
-      raw = strings.TrimSpace(raw)
-      if raw == "" {
-        continue
-      }
-      // keep substring starting from timestamp, if present
-      idx := tsRe.FindStringIndex(raw)
-      if idx != nil {
-        raw = raw[idx[0]:] // drop anything to the left of timestamp
-      } else if raw == "" || raw == "\n" {
-        continue
-      }
-      w.Write([]byte(raw + "\n"))
-    }
+		tsRe := regexp.MustCompile(`\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]`)
+		for _, raw := range strings.Split(result, "\n") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			// keep substring starting from timestamp, if present
+			idx := tsRe.FindStringIndex(raw)
+			if idx != nil {
+				raw = raw[idx[0]:] // drop anything to the left of timestamp
+			} else if raw == "" || raw == "\n" {
+				continue
+			}
+			w.Write([]byte(raw + "\n"))
+		}
 	}
 }
 
 // chatsHandler proxies WebSocket <‑> pod TTY
 func chatsHandler(cli *kubernetes.Clientset, cfg *rest.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+    return func(w http.ResponseWriter, r *http.Request) {
+        conn, err := upgrader.Upgrade(w, r, nil)
+        if err != nil {
+            return
+        }
+        defer conn.Close()
 
-		pods, err := cli.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: labelSelector, Limit: 1})
-		if err != nil || len(pods.Items) == 0 {
-			conn.WriteMessage(websocket.TextMessage, []byte("no pod"))
-			return
-		}
-		pod := pods.Items[0]
+		// --- resilient attach & reconnect every 5s until WS closes ---
+        type streamHandle struct {
+            pw     *io.PipeWriter
+            done   chan struct{}
+            cancel context.CancelFunc
+        }
 
-		pr, pw := io.Pipe()
-		attach := cli.CoreV1().RESTClient().Post().Resource("pods").Name(pod.Name).
-			Namespace(namespace).SubResource("attach").
-			VersionedParams(&v1.PodAttachOptions{
-				Container: pod.Spec.Containers[0].Name,
-				Stdin:     true,
-				Stdout:    true,
-				Stderr:    true,
-				TTY:       true,
-			}, runtime.NewParameterCodec(scheme))
-		exec, err := remotecommand.NewSPDYExecutor(cfg, "POST", attach.URL())
-		if err != nil {
-			conn.WriteMessage(websocket.TextMessage, []byte("attach init error"))
-			return
-		}
+		var (
+			cur *streamHandle
+		)
 
-		go exec.Stream(remotecommand.StreamOptions{Stdin: pr, Stdout: &wsWriter{conn}, Stderr: &wsWriter{conn}, Tty: true})
+        attachToFirstPod := func(ctx context.Context) (*streamHandle, error) {
+            pods, err := cli.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: labelSelector, Limit: 1})
+            if err != nil || len(pods.Items) == 0 {
+                return nil, fmt.Errorf("no pod")
+            }
+            pod := pods.Items[0]
+            pr, pw := io.Pipe()
+            attach := cli.CoreV1().RESTClient().Post().Resource("pods").Name(pod.Name).
+                Namespace(namespace).SubResource("attach").
+                VersionedParams(&v1.PodAttachOptions{
+                    Container: pod.Spec.Containers[0].Name,
+                    Stdin:     true,
+                    Stdout:    true,
+                    Stderr:    true,
+                    TTY:       true,
+                }, runtime.NewParameterCodec(scheme))
+            ex, err := remotecommand.NewSPDYExecutor(cfg, "POST", attach.URL())
+            if err != nil {
+                return nil, err
+            }
+            done := make(chan struct{})
+            sctx, cancel := context.WithCancel(ctx)
+            go func() {
+                _ = ex.StreamWithContext(sctx, remotecommand.StreamOptions{Stdin: pr, Stdout: &wsWriter{conn}, Stderr: &wsWriter{conn}, Tty: true})
+                close(done)
+            }()
+            return &streamHandle{pw: pw, done: done, cancel: cancel}, nil
+        }
 
-		for {
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				pw.Close()
-				break
+		// goroutine: read from websocket and forward to current stream if available
+		msgCh := make(chan []byte)
+		go func() {
+			defer close(msgCh)
+			for {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				// append newline if not present to mimic terminal enter
+				msgCh <- msg
 			}
-			pw.Write(msg)
-		}
-	}
+		}()
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		// main loop: maintain connection and forward messages
+        baseCtx := r.Context()
+        for {
+            // ensure we have an active stream
+            if cur == nil {
+                if h, err := attachToFirstPod(baseCtx); err == nil {
+                    cur = h
+                    _ = conn.WriteMessage(websocket.TextMessage, []byte("attached to pod"))
+                } else {
+                    // inform client once per attempt tick via ticker
+                }
+            }
+
+			select {
+			case msg, ok := <-msgCh:
+                if !ok { // websocket closed
+                    if cur != nil {
+                        cur.pw.Close()
+                        cur.cancel()
+                    }
+                    return
+                }
+                if cur != nil {
+                    _, _ = cur.pw.Write(msg)
+                } else {
+                    // optionally notify user that input is dropped
+                }
+            case <-ticker.C:
+                // if not connected, try again
+                if cur == nil {
+                    if h, err := attachToFirstPod(baseCtx); err == nil {
+                        cur = h
+                        _ = conn.WriteMessage(websocket.TextMessage, []byte("attached to pod"))
+                    } else {
+                        _ = conn.WriteMessage(websocket.TextMessage, []byte("waiting for pod..."))
+                    }
+                }
+            case <-func() <-chan struct{} {
+                if cur == nil {
+                    ch := make(chan struct{})
+                    close(ch)
+                    return ch
+                }
+                return cur.done
+            }():
+                // stream ended (likely pod deleted); clear and retry on next tick
+                if cur != nil {
+                    cur.pw.Close()
+                    cur.cancel()
+                }
+                cur = nil
+                _ = conn.WriteMessage(websocket.TextMessage, []byte("pod disconnected; retrying..."))
+            }
+        }
+    }
 }
 
 type wsWriter struct{ conn *websocket.Conn }
