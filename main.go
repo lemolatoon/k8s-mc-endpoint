@@ -48,9 +48,58 @@ func main() {
 	http.HandleFunc("/logs", logsHandler(cli))
 	http.HandleFunc("/list", listHandler(cli, cfg))
 	http.HandleFunc("/chats", chatsHandler(cli, cfg))
+	http.HandleFunc("/kill", killHandler(cli))
 
 	fmt.Println("Server listening on", addr)
 	_ = http.ListenAndServe(addr, nil)
+}
+
+// killHandler deletes all Pods matching the label selector in the target namespace
+func killHandler(cli *kubernetes.Clientset) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+            w.Header().Set("Allow", "POST, DELETE")
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        ctx := r.Context()
+        pods, err := cli.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        if len(pods.Items) == 0 {
+            w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+            w.WriteHeader(http.StatusOK)
+            _, _ = w.Write([]byte("no pods to delete\n"))
+            return
+        }
+        var (
+            failed []string
+            deleted []string
+        )
+        gp := int64(0)
+        opts := metav1.DeleteOptions{GracePeriodSeconds: &gp}
+        for _, p := range pods.Items {
+            if err := cli.CoreV1().Pods(namespace).Delete(ctx, p.Name, opts); err != nil {
+                failed = append(failed, fmt.Sprintf("%s (%v)", p.Name, err))
+            } else {
+                deleted = append(deleted, p.Name)
+            }
+        }
+        w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+        if len(failed) > 0 {
+            w.WriteHeader(http.StatusMultiStatus)
+        } else {
+            w.WriteHeader(http.StatusOK)
+        }
+        if len(deleted) > 0 {
+            _, _ = w.Write([]byte("deleted: " + strings.Join(deleted, ", ") + "\n"))
+        }
+        if len(failed) > 0 {
+            _, _ = w.Write([]byte("failed: " + strings.Join(failed, "; ") + "\n"))
+        }
+    }
 }
 
 // logsHandler streams logs of all matching Pods
