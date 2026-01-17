@@ -21,15 +21,27 @@ import (
 )
 
 const (
-	namespace     = "minecraft-skies2"
-	labelSelector = "app=minecraft-skies2"
-	addr          = ":8080"
+	defaultNamespace     = "minecraft-skies2"
+	defaultLabelSelector = "app=minecraft-skies2"
+	defaultAddr          = ":8080"
 )
 
 var (
+	namespace     = getEnv("MC_NAMESPACE", defaultNamespace)
+	labelSelector = getEnv("MC_LABEL_SELECTOR", defaultLabelSelector)
+	addr          = getEnv("LISTEN_ADDR", defaultAddr)
+
 	scheme   = runtime.NewScheme()
 	upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 )
+
+func getEnv(key, def string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	return v
+}
 
 func main() {
 	v1.AddToScheme(scheme)
